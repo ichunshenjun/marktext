@@ -60,3 +60,7 @@ cmake ..
 ```
 sudo apt install clangd
 ```
+
+## clash
+
+右键clash打开系统代理
