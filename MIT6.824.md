@@ -153,3 +153,63 @@
   ![](assets/2023-09-11-22-22-28-image.png)
   
   是因为把旧的日志快照应用了导致状态错误。
+
+## lab4
+
+### lab4A
+
+#### 思路
+
++ 为什么要有lab4？
+  
+  在`Lab2`和`Lab3`，实现了基于单`RAFT`（单一集群）的多节点间数据一致性、支持增删查改、数据同步和快照保存的`KV`数据库。但忽视了集群负载问题，随着数据增长到一定程度时，所有的数据请求都集中在`leader`上，增加集群压力，延长请求响应时。
+  
+  `Lab4`的内容就是将数据按照某种方式分开存储到不同的`RAFT`集群(`Group`)上，分片(`shard`)的策略有很多，比如：所有以`a`开头的键是一个分片，所有以`b`开头的键是一个分片。保证相应数据请求引流到对应的集群，降低单一集群的压力，提供更为高效、更为健壮的服务。框架如下图
+  
+  ![](assets/2023-10-29-20-10-15-image.png)
+  
+  这个图有的地方不一定准，比如每个group里的server不一定是一样的，而且每个group可以有不同的shard。比如group1里有server1，server2，并且group1里有shard0，shard3；group2里有server3，server4，并且group2里有shard2，shard4。sc和特定的group没有关系，一个sc里有configs，configs里有多个config，一个config里有shards和group。
+
++ 理解下面这些概念（参考[CJuncheng/MIT6.824-LABs: These are four labs implementation of MIT 6.824(Spring 2022, 6.5840) (github.com)](https://github.com/CJuncheng/MIT6.824-LABs/tree/main#%E7%9B%AE%E5%BD%95)）
+  
+  ![](assets/2023-10-29-20-04-16-image.png)
+
++ 首先明白config里的shards和group的概念
+  
+  ![](assets/2023-10-29-20-03-00-image.png)
+  
+  shards为10个元素的数组分别是编号为0-9的shard属于的group的编号如下
+  
+  ![](assets/2023-10-29-19-58-56-image.png)
+  
+  表示shard0属于group503，shard1属于group504。
+  
+  config里的num成员表示这是config的编号。
+  
+  config里的group表示每个group里的servers是啥。
+  
+  ![](assets/2023-10-29-20-00-47-image.png)
+  
+  上面这个代码里的实际运行结果表示这是编号为6的config，shards为[503 ... 504],后面的map就是group表示503号group里有3a 3b 3c三个服务器。
+
++ 实现思路其实和lab3很像，clerk（ck）是客户端，有多个客户端向服务器端发送请求，服务器端为ShardCtrler（sc），每个sc里除了有lab3里的kvserver那些玩意外还有configs（所以config才有编号），与lab3对标这里发出的就是Join，Leave，Move，Query四种请求，发送请求的过程和反馈与lab3是完全一致的，那么区别只是在sc应用这个请求的时候（applyCommand），lab3里是修改自己的数据库，这里是根据不同的请求添加新的config。每个请求做什么事可以直接看comman.go里面请求的参数，对于Join请求，参数里有个servers，其实就是在config的group里添加新的GID->servers mappings的映射，但是添加完后还需要实现负载均衡，负载均衡具体怎么实现呢？负载均衡的概念就是使得每个group里的shard数量相差不大于1。具体做法为首先由于config里的shards是shard->GID的映射（因为一个shard只能属于一个GID所以shards是个大小为10的数组），我们需要得到GID->shards的映射（GrouptoShards函数），这得是个map即g2s（因为一个GID里对应多个shard），然后分别求出shard数量最多和最少的GID如果这两个shard数量相差已经小于等于1就不需要再均衡了，否则把最多的GID里分一个shard给最少的GID，一直重复这个操作直到负载均衡（distributeShards函数）。对于Leave请求只是把某些GID删除了而已，从config的group里删除这些GID就好，然后也是负载均衡。我这里的leave和join实现都是newConfig.Shards没有继承之前的shards，然后全靠负载均衡全部重新分配，这样要移动的切片很多，其实应该要继承，然后类似leave这种删除GID不仅要group里删除还要相应的g2s也要进行删除。
+
+#### bug
+
++ 第一次join就没通过
+  
+  ![](assets/2023-10-28-20-38-18-image.png)
+  
+  发现是客户端的lastAppliedCommandId忘记更新了直接导致raft同步失败（同步之前已经提交的命令）。加上下面这句就好了。
+  
+  ![](assets/2023-10-29-11-28-43-image.png)
+
++ leave出错
+  
+  getminShardsGid函数里出错，for gid:=range gids写错了，应该是下面
+  
+  <img src="assets/2023-10-29-17-56-32-image.png" title="" alt="" width="356">
+
++ move出错
+  
+  发现是新配置忘记复制老配置的shards了，注意leave和join以及query都不需要复制，因为leave和join有负载均衡会重新分配shards
